@@ -128,6 +128,7 @@ class GroundedAnswer:
     model_name: str
     generation_time_ms: float
     style: str = "conversational"
+    images: List[Dict[str, Any]] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -142,6 +143,7 @@ class GroundedAnswer:
         return {
             "query": self.query,
             "answer": self.answer,
+            "images": self.images,
             "abstained": self.abstained,
             "abstention_reason": self.abstention_reason,
             "confidence": round(self.confidence, 4),

@@ -13,6 +13,8 @@ from core.pipeline import HopfieldQAPipeline, PipelineConfig
 from core.llm_provider import LLMConfig, create_llm_provider, MockLLMProvider
 from core.chat_manager import ChatManager
 from utils.file_utils import extract_text_from_file
+from utils.image_extractor import extract_images_from_file_bytes
+from pathlib import Path
 
 app = FastAPI(title="Hopfield QA API")
 
@@ -196,7 +198,12 @@ def search(req: SearchRequest):
             "published_date": getattr(chunk, 'published_date', meta.get('published_date')),
             "page_number": getattr(chunk, 'page_number', meta.get("page_number")),
             "is_core_attractor": is_core,
-            "role": "Core Attractor Basin" if is_core else "Associative Bridge"
+            "role": "Core Attractor Basin" if is_core else "Associative Bridge",
+            "has_image": meta.get("has_image", False),
+            "image_url": meta.get("image_url"),
+            "image_caption": meta.get("image_caption"),
+            "width": meta.get("width"),
+            "height": meta.get("height"),
         })
     
     associative_diagnostics = None
@@ -276,6 +283,33 @@ def search(req: SearchRequest):
     }
 
     contextualized_q = getattr(getattr(res, "processed_query", None), "metadata", {}).get("contextualized_query")
+
+    # Collect relevant visual figures from evidence chunks and grounded_answer
+    retrieved_images = []
+    seen_images = set()
+    for ev in evidence_list:
+        img_url = ev.get("image_url")
+        if img_url and img_url not in seen_images:
+            seen_images.add(img_url)
+            retrieved_images.append({
+                "image_url": img_url,
+                "caption": ev.get("image_caption") or f"Figure from {ev.get('source')}",
+                "page_number": ev.get("page_number", 1),
+                "source": ev.get("source"),
+                "score": ev.get("score", 0.0),
+                "width": ev.get("width"),
+                "height": ev.get("height"),
+            })
+    if res.grounded_answer and hasattr(res.grounded_answer, "images") and res.grounded_answer.images:
+        for g_img in res.grounded_answer.images:
+            img_url = g_img.get("image_url")
+            if img_url and img_url not in seen_images:
+                seen_images.add(img_url)
+                retrieved_images.append(g_img)
+
+    if grounded_data:
+        grounded_data["images"] = retrieved_images
+
     response_payload = {
         "query": req.query,
         "contextualized_query": contextualized_q,
@@ -284,6 +318,7 @@ def search(req: SearchRequest):
         "answer": res.answer.answer,
         "confidence": float(res.answer.confidence) if res.answer.confidence is not None else 0.0,
         "evidence": evidence_list,
+        "images": retrieved_images,
         "grounded_answer": grounded_data,
         "associative_diagnostics": associative_diagnostics,
         "latencies": latencies,
@@ -414,6 +449,17 @@ async def upload_document(file: UploadFile = File(...)):
         )
 
     try:
+        ext = Path(file.filename).suffix.lower()
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+            extracted_images = extract_images_from_file_bytes(content, file.filename, output_dir="static/extracted_images")
+            title = Path(file.filename).stem.replace('_', ' ').title()
+            text = f"Graphic and visual document containing diagram or figure titled '{title}'."
+            pipeline.add_document(text, file.filename, images=extracted_images)
+            total_chunks = pipeline.n_chunks
+            return {
+                "message": f"Successfully ingested visual figure '{file.filename}' into Hopfield memory."
+            }
+
         bio = io.BytesIO(content)
         text, _ = extract_text_from_file(bio, file.filename)
             
@@ -421,12 +467,14 @@ async def upload_document(file: UploadFile = File(...)):
             raise ValueError(f"Extracted text from '{file.filename}' is empty or unreadable. Please check the document format.")
             
         print(f"[API] Upload request received: {file.filename} ({len(content)} bytes)", flush=True)
-        docs = [(text, file.filename)]
-        pipeline.add_documents(docs)
+        extracted_images = extract_images_from_file_bytes(content, file.filename, output_dir="static/extracted_images")
+        pipeline.add_document(text, file.filename, images=extracted_images)
         total_chunks = pipeline.n_chunks
-        print(f"[API] Successfully ingested {file.filename}: {total_chunks} total chunks indexed.", flush=True)
+        img_info = f", {len(extracted_images)} figures" if extracted_images else ""
+        print(f"[API] Successfully ingested {file.filename}: {total_chunks} total chunks indexed ({len(extracted_images)} figures).", flush=True)
         return {
-            "message": f"Successfully ingested {file.filename} ({total_chunks} chunks indexed in Hopfield memory)."
+            "message": f"Successfully ingested {file.filename} ({total_chunks} total chunks{img_info} indexed in Hopfield memory).",
+            "images_extracted": len(extracted_images)
         }
     except Exception as e:
         traceback.print_exc()
@@ -504,6 +552,8 @@ async def get_index():
     return response
 
 os.makedirs("static", exist_ok=True)
+os.makedirs("static/extracted_images", exist_ok=True)
+app.mount("/extracted_images", StaticFiles(directory="static/extracted_images"), name="extracted_images")
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":

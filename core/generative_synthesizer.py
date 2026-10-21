@@ -2258,6 +2258,24 @@ class GenerativeRAGSynthesizer:
         if llm_completion_tokens is not None:
             metadata["completion_tokens"] = llm_completion_tokens
 
+        # Collect relevant visual figures from retrieved attractor evidence
+        retrieved_images = []
+        seen_img_urls = set()
+        for c in clean_evidence.chunks:
+            meta = getattr(c, "metadata", {}) or {}
+            img_url = meta.get("image_url")
+            if img_url and img_url not in seen_img_urls:
+                seen_img_urls.add(img_url)
+                retrieved_images.append({
+                    "image_url": img_url,
+                    "caption": meta.get("image_caption") or f"Figure from {c.source}",
+                    "page_number": meta.get("page_number", c.page_number or 1),
+                    "source": c.source,
+                    "similarity_score": round(getattr(c, "similarity_score", 0.0), 4),
+                    "width": meta.get("width"),
+                    "height": meta.get("height"),
+                })
+
         return GroundedAnswer(
             query=query,
             answer=generated_text,
@@ -2270,6 +2288,7 @@ class GenerativeRAGSynthesizer:
             model_name=model_name,
             generation_time_ms=round(total_gen_ms, 2),
             style=style,
+            images=retrieved_images,
             metadata=metadata
         )
 

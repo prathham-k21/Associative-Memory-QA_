@@ -31,5 +31,6 @@ htmlcov/
 # Local data & databases
 data/
 scratch/
+static/extracted_images/
 *.db
 mlflow.db

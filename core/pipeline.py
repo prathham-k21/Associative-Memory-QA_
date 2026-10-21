@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import json
 import re
+import hashlib
 import logging
 
 from core.embeddings import DocumentChunker, EmbeddingEngine, Chunk
@@ -222,26 +223,29 @@ class HopfieldQAPipeline:
         # State
         self._all_chunks: List[Chunk] = []
         self._documents: Dict[str, str] = {}  # source → original text
+        self._document_images: Dict[str, List[Dict[str, Any]]] = {}  # source → list of image metadata dicts
         self._is_ready = False
 
         # Document Persistence recovery
         self._recover_persisted_index()
 
     def _recover_persisted_index(self):
-        """Recover indexed documents from disk if available."""
+        """Recover indexed documents and their visual figures from disk if available."""
         pers_path = Path(self.config.persistence_dir) / "memory_store.json"
-        if not pers_path.exists():
+        if not pers_path.exists() and self.config.persistence_dir == "data":
             pers_path = Path(__file__).resolve().parent.parent / "data" / "memory_store.json"
         if pers_path.exists():
             try:
                 with open(pers_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     docs = data.get("documents", {})
+                    doc_images = data.get("document_images", {})
                     if docs:
                         logger.info(f"Recovering {len(docs)} persisted documents from {pers_path}...")
                         print(f"Recovering {len(docs)} persisted documents from {pers_path}...")
                         for source, text in docs.items():
-                            self.add_document(text, source=source, persist=False)
+                            imgs = doc_images.get(source, [])
+                            self.add_document(text, source=source, persist=False, images=imgs)
             except Exception as e:
                 logger.warning(f"Could not recover persisted document index: {e}")
                 print(f"Could not recover persisted document index: {e}")
@@ -264,28 +268,64 @@ class HopfieldQAPipeline:
         source: str = "document",
         progress_callback=None,
         persist: bool = True,
+        images: Optional[List[Any]] = None,
     ) -> Dict:
         """
         Add a document to the Hopfield memory.
 
         Process:
         1. Chunk the text
-        2. Embed chunks
+        2. Embed chunks + any extracted visual figure chunks
         3. Store in Hopfield network
 
         Returns stats about the added document.
         """
-        if not text.strip():
-            return {"error": "Empty document text"}
+        if not text.strip() and not images:
+            return {"error": "Empty document text and no images"}
 
         t0 = time.time()
 
-        # Chunk
-        if progress_callback:
-            progress_callback("Chunking document...", 0.2)
-        chunks = self.chunker.chunk_text(text, source=source)
+        # Chunk text if text is provided
+        chunks = []
+        if text.strip():
+            if progress_callback:
+                progress_callback("Chunking document...", 0.2)
+            chunks = self.chunker.chunk_text(text, source=source)
 
-        # Embed
+        # Create image-anchored chunks for extracted visual figures/diagrams
+        if images:
+            img_meta_list = []
+            for idx, img in enumerate(images):
+                img_data = img.to_dict() if hasattr(img, "to_dict") else img
+                img_meta_list.append(img_data)
+                img_url = img_data.get("image_url", "")
+                caption = img_data.get("caption", f"Figure {idx+1}")
+                context_snippet = img_data.get("context_text", "")
+                page_num = img_data.get("page_number", 1)
+
+                img_text = f"[Visual Figure: {caption}]\nDocument: {source} (Page {page_num})\nVisual Content & Context: {context_snippet}"
+                chunk_id = f"img_{hashlib.md5((source + str(page_num) + img_url).encode()).hexdigest()[:12]}"
+                img_chunk = Chunk(
+                    chunk_id=chunk_id,
+                    text=img_text,
+                    source=source,
+                    chunk_index=len(chunks) + idx,
+                    start_char=0,
+                    end_char=len(img_text),
+                    metadata={
+                        "has_image": True,
+                        "image_url": img_url,
+                        "image_caption": caption,
+                        "page_number": page_num,
+                        "source_type": "document",
+                        "width": img_data.get("width"),
+                        "height": img_data.get("height"),
+                    }
+                )
+                chunks.append(img_chunk)
+            self._document_images[source] = img_meta_list
+
+        # Embed all chunks (text + visual)
         if progress_callback:
             progress_callback("Generating embeddings...", 0.5)
         chunks = self.embedder.embed_chunks(chunks, show_progress=False)
@@ -307,7 +347,7 @@ class HopfieldQAPipeline:
                 p_dir = Path(self.config.persistence_dir)
                 p_dir.mkdir(parents=True, exist_ok=True)
                 with open(p_dir / "memory_store.json", "w", encoding="utf-8") as f:
-                    json.dump({"documents": self._documents}, f, indent=2)
+                    json.dump({"documents": self._documents, "document_images": self._document_images}, f, indent=2)
             except Exception as e:
                 logger.warning(f"Could not persist document store: {e}")
 
@@ -350,6 +390,8 @@ class HopfieldQAPipeline:
             return False
 
         del self._documents[source]
+        if source in self._document_images:
+            del self._document_images[source]
         self._all_chunks = [c for c in self._all_chunks if c.source != source]
 
         if self._all_chunks:
@@ -364,7 +406,7 @@ class HopfieldQAPipeline:
             p_dir = Path(self.config.persistence_dir)
             p_dir.mkdir(parents=True, exist_ok=True)
             with open(p_dir / "memory_store.json", "w", encoding="utf-8") as f:
-                json.dump({"documents": self._documents}, f, indent=2)
+                json.dump({"documents": self._documents, "document_images": self._document_images}, f, indent=2)
             logger.info(f"Removed document '{source}' from Hopfield memory store.")
         except Exception as e:
             logger.warning(f"Could not persist document store after removal: {e}")
@@ -379,7 +421,7 @@ class HopfieldQAPipeline:
         # Stack all embeddings
         patterns = np.vstack([c.embedding for c in self._all_chunks])
 
-        # Build metadata list
+        # Build metadata list preserving visual attributes
         metadata = [
             {
                 "chunk_id": c.chunk_id,
@@ -388,6 +430,7 @@ class HopfieldQAPipeline:
                 "chunk_index": c.chunk_index,
                 "start_char": c.start_char,
                 "end_char": c.end_char,
+                **(c.metadata or {})
             }
             for c in self._all_chunks
         ]
