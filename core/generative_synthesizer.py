@@ -895,14 +895,21 @@ class GenerativeRAGSynthesizer:
 
                 if intent == "WHAT_DEFINITION":
                     if target_lower:
-                        if cand_subj and target_lower in cand_subj:
-                            # Genuine definition of the requested subject!
-                            score += 6.0
+                        if cand_subj and cand_subj == target_lower:
+                            # Pristine direct definition of the requested subject!
+                            score += 8.5
+                            if any(w in s_lower for w in ["refers to", "defined as", "is defined as", "is a", "is an", "describes", "is characterised", "is characterized"]):
+                                score += 3.5
+                        elif cand_subj and target_lower in cand_subj:
+                            # Defines a sub-concept or compound subject (e.g. "big data storage")
+                            score += 4.0
                         elif cand_subj and any(w in s_clean.lower() for w in ["are measurable values", "is a record of", "is a file format"]):
                             # Defines an auxiliary sub-concept rather than the primary target
                             score -= 3.0
                         elif target_lower in s_lower:
                             score += 3.5
+                            if any(w in s_lower for w in ["refers to", "defined as", "is defined as"]):
+                                score += 2.5
                     else:
                         if any(w in s_lower for w in ["functions as", "is a", "is an", "is the", "was a", "was the", "defined as", "refers to", "serves as"]):
                             score += 2.5

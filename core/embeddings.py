@@ -55,7 +55,7 @@ class DocumentChunker:
         self.split_by_sentence = split_by_sentence
 
     def _split_sentences(self, text: str) -> List[str]:
-        """Split text into sentences using regex."""
+        """Split text into sentences using regex, preserving boundaries from headings."""
         sentence_pattern = re.compile(
             r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|!)\s'
         )
@@ -67,7 +67,11 @@ class DocumentChunker:
         return hashlib.md5(content.encode()).hexdigest()[:12]
 
     def chunk_text(self, text: str, source: str = "document") -> List[Chunk]:
-        """Split text into overlapping chunks."""
+        """Split text into overlapping chunks with heading and paragraph boundary preservation."""
+        orig_text = text
+        text = re.sub(r'\r\n|\r', '\n', text)
+        text = re.sub(r'\n\s*\n+', '. ', text)
+        text = re.sub(r'(?<=[a-zA-Z0-9\)])\s*\n\s*(?=[A-Z0-9])', '. ', text)
         text = re.sub(r'\s+', ' ', text).strip()
 
         if len(text) <= self.chunk_size:
@@ -99,12 +103,19 @@ class DocumentChunker:
         current_sentences = []
         current_length = 0
         chunk_index = 0
-        char_pos = 0
 
         for sentence in sentences:
             sentence_len = len(sentence) + 1  # +1 for space
 
-            if current_length + sentence_len > self.chunk_size and current_sentences:
+            # Separate institutional/course cover headers from body content
+            is_sec_break = bool(re.search(r'^(?:unit\s+\d+|chapter\s+\d+|module\s+\d+|section\s+\d+|concept\s+of\b)', sentence.strip().lower()))
+            has_inst_header = any(
+                any(k in s.lower() for k in ["college of", "university", "department of", "course code", "autonomous", "syllabus"])
+                for s in current_sentences
+            )
+            should_split = (current_length + sentence_len > self.chunk_size) or (is_sec_break and has_inst_header)
+
+            if should_split and current_sentences:
                 chunk_text = ' '.join(current_sentences)
                 start = original_text.find(chunk_text[:30])
                 chunk_id = self._create_chunk_id(source, chunk_index, chunk_text)
@@ -119,18 +130,22 @@ class DocumentChunker:
                 ))
                 chunk_index += 1
 
-                # Overlap: keep last few sentences
-                overlap_sentences = []
-                overlap_len = 0
-                for s in reversed(current_sentences):
-                    if overlap_len + len(s) < self.chunk_overlap:
-                        overlap_sentences.insert(0, s)
-                        overlap_len += len(s) + 1
-                    else:
-                        break
-
-                current_sentences = overlap_sentences
-                current_length = overlap_len
+                # If cutting after institutional header, do not carry header into body chunk
+                if is_sec_break and has_inst_header:
+                    current_sentences = []
+                    current_length = 0
+                else:
+                    # Overlap: keep last few sentences
+                    overlap_sentences = []
+                    overlap_len = 0
+                    for s in reversed(current_sentences):
+                        if overlap_len + len(s) < self.chunk_overlap:
+                            overlap_sentences.insert(0, s)
+                            overlap_len += len(s) + 1
+                        else:
+                            break
+                    current_sentences = overlap_sentences
+                    current_length = overlap_len
 
             current_sentences.append(sentence)
             current_length += sentence_len

@@ -169,6 +169,9 @@ class HopfieldAssociativeEngine:
         converged = False
         steps_taken = 0
 
+        # Cache entry query projections directly from query embedding
+        entry_projections = torch.matmul(patterns, z.t()).squeeze(-1)
+
         # 2. Iterate through Continuous Attractor Dynamics
         for hop in range(self.max_hops):
             steps_taken += 1
@@ -181,8 +184,8 @@ class HopfieldAssociativeEngine:
             # readout = sum_i attn_i * x_i
             readout = torch.matmul(attn_weights.unsqueeze(0), patterns) # (1, d)
 
-            # Continuous relaxation update with momentum/inertia
-            new_state = (1.0 - self.alpha) * current_state + self.alpha * readout
+            # Continuous relaxation update with momentum/inertia and residual query anchor
+            new_state = (1.0 - self.alpha) * current_state + self.alpha * readout + 0.15 * z
             new_state = F.normalize(new_state, p=2, dim=-1)
 
             # Measure state displacement
@@ -230,7 +233,9 @@ class HopfieldAssociativeEngine:
         # 3. Partition Evidence: Attractor Core vs. Associative Bridges
         # Attractor core: Chunks with highest attention at convergence
         final_projections = torch.matmul(patterns, current_state.t()).squeeze(-1)
-        final_scaled = self.beta * final_projections
+        # Blend direct entry similarity (65%) with attractor convergence (35%)
+        blended_projections = 0.65 * entry_projections + 0.35 * final_projections
+        final_scaled = self.beta * blended_projections
         final_attn = F.softmax(final_scaled - torch.max(final_scaled), dim=-1)
 
         # Entity-aware hybrid co-attractor reinforcement
@@ -328,7 +333,7 @@ class HopfieldAssociativeEngine:
 
         def build_retrieval_result(idx: int, rank: int, is_core: bool) -> RetrievalResult:
             meta = metadata[idx]
-            sim = float(final_projections[idx].item())
+            sim = float(blended_projections[idx].item())
             attn = float(final_attn[idx].item())
             meta_copy = dict(meta)
             meta_copy["is_core_attractor"] = is_core

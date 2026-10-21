@@ -306,13 +306,25 @@ def search(req: SearchRequest):
             if img_url and img_url not in seen_images:
                 seen_images.add(img_url)
                 retrieved_images.append(g_img)
+    if hasattr(res, "images") and res.images:
+        for r_img in res.images:
+            img_url = r_img.get("image_url")
+            if img_url and img_url not in seen_images:
+                seen_images.add(img_url)
+                retrieved_images.append(r_img)
 
     if grounded_data:
         grounded_data["images"] = retrieved_images
 
+    proc_meta = getattr(getattr(res, "processed_query", None), "metadata", {}) or {}
+    typos_fixed = proc_meta.get("typos_fixed", {})
+    corrected_q = proc_meta.get("corrected_query")
+
     response_payload = {
         "query": req.query,
         "contextualized_query": contextualized_q,
+        "corrected_query": corrected_q,
+        "typos_fixed": typos_fixed,
         "retriever_mode": active_retriever,
         "engine_mode": "associative" if active_retriever in ("hopfield", "hybrid") else "naive_rag",
         "answer": res.answer.answer,

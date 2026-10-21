@@ -100,6 +100,7 @@ class QueryResult:
     format_requested: Optional[str] = None
     sufficiency_decision: Optional[Dict[str, Any]] = None
     web_sources: List[Dict[str, Any]] = field(default_factory=list)
+    images: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class HopfieldQAPipeline:
@@ -291,6 +292,7 @@ class HopfieldQAPipeline:
             if progress_callback:
                 progress_callback("Chunking document...", 0.2)
             chunks = self.chunker.chunk_text(text, source=source)
+            self.query_processor.update_vocabulary(text)
 
         # Create image-anchored chunks for extracted visual figures/diagrams
         if images:
@@ -303,7 +305,10 @@ class HopfieldQAPipeline:
                 context_snippet = img_data.get("context_text", "")
                 page_num = img_data.get("page_number", 1)
 
-                img_text = f"[Visual Figure: {caption}]\nDocument: {source} (Page {page_num})\nVisual Content & Context: {context_snippet}"
+                self.query_processor.update_vocabulary(caption)
+                self.query_processor.update_vocabulary(context_snippet[:300])
+
+                img_text = f"Visual Figure and Diagram: {caption}. Overview: {context_snippet[:250]}"
                 chunk_id = f"img_{hashlib.md5((source + str(page_num) + img_url).encode()).hexdigest()[:12]}"
                 img_chunk = Chunk(
                     chunk_id=chunk_id,
@@ -592,6 +597,23 @@ class HopfieldQAPipeline:
         total_time = max(0.1, (time.perf_counter() - t0) * 1000)
         logger.info(f"Query completed in {total_time:.1f}ms with {len(dedup_evidence_collection.chunks)} unique chunks (web_used={coord_res.web_search_performed}, cached_used={coord_res.cached_knowledge_used}, abstained={grounded_answer.abstained}).")
 
+        # 8. Multimodal Visual Figure Retrieval and Associative Bridging
+        relevant_images = self.retrieve_relevant_figures(
+            query=query_text,
+            query_embedding=query_embedding,
+            evidence_chunks=dedup_evidence_collection.chunks if dedup_evidence_collection else [],
+            top_n=3,
+            threshold=0.35,
+            source_filter=effective_doc_filter,
+        )
+        if grounded_answer:
+            existing_urls = {img.get("image_url") for img in grounded_answer.images}
+            for fig in relevant_images:
+                if fig.get("image_url") not in existing_urls:
+                    existing_urls.add(fig.get("image_url"))
+                    grounded_answer.images.append(fig)
+            grounded_answer.images.sort(key=lambda x: x.get("score", x.get("similarity_score", 0.0)), reverse=True)
+
         synth_stages = (grounded_answer.metadata.get("stage_latencies_ms") or {}) if grounded_answer else {}
         stage_latencies = {
             "embed_ms": round(embed_time_ms, 2),
@@ -601,6 +623,8 @@ class HopfieldQAPipeline:
             "total_ms": round(total_time, 2),
             **synth_stages
         }
+
+        final_images = grounded_answer.images if (grounded_answer and grounded_answer.images) else relevant_images
 
         return QueryResult(
             query=raw_query,
@@ -620,8 +644,77 @@ class HopfieldQAPipeline:
             format_detected=detected_fmt,
             format_requested=answer_format or answer_style,
             sufficiency_decision=coord_res.sufficiency_decision.__dict__ if coord_res.sufficiency_decision else None,
-            web_sources=coord_res.web_sources
+            web_sources=coord_res.web_sources,
+            images=final_images
         )
+
+    def retrieve_relevant_figures(
+        self,
+        query: str,
+        query_embedding: np.ndarray,
+        evidence_chunks: Optional[List[Any]] = None,
+        top_n: int = 3,
+        threshold: float = 0.35,
+        source_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Multimodal visual figure retrieval and associative bridging.
+        Identifies figures with semantic alignment to the query and associative linkage
+        to retrieved evidence (page proximity or caption mentions).
+        """
+        all_images = []
+        for src, img_list in self._document_images.items():
+            if source_filter and source_filter.lower() not in src.lower():
+                continue
+            for img in img_list:
+                img_dict = img if isinstance(img, dict) else img.to_dict()
+                all_images.append(dict(img_dict))
+
+        if not all_images:
+            return []
+
+        q_norm = query_embedding / max(np.linalg.norm(query_embedding), 1e-8)
+        evidence = evidence_chunks or []
+        evidence_pages = {getattr(c, 'page_number', None) for c in evidence if getattr(c, 'page_number', None) is not None}
+        evidence_sources = {getattr(c, 'source', '') for c in evidence}
+        evidence_text = " ".join([getattr(c, 'text', '') for c in evidence]).lower()
+
+        scored_figures = []
+        for img in all_images:
+            cap = img.get("caption", "")
+            ctx = img.get("context_text", "")[:250]
+            fig_repr = f"{cap}. {ctx}"
+            fig_emb = self.embedder.embed_query(fig_repr)
+            fig_norm = fig_emb / max(np.linalg.norm(fig_emb), 1e-8)
+            cos_sim = float(np.dot(q_norm, fig_norm))
+
+            # Associative bridge bonus
+            bonus = 0.0
+            # 1. Mention of caption in retrieved evidence
+            cap_clean = re.sub(r'^(fig(?:ure)?[:\s\-]+)', '', cap, flags=re.I).strip().lower()
+            if cap_clean and len(cap_clean) >= 4 and cap_clean in evidence_text:
+                bonus += 0.20
+            # 2. Co-occurrence on the same page as retrieved evidence
+            img_page = img.get("page_number")
+            if img_page and img_page in evidence_pages and img.get("source") in evidence_sources:
+                bonus += 0.15
+
+            final_score = min(1.0, cos_sim + bonus)
+
+            if final_score >= threshold:
+                scored_figures.append({
+                    "image_url": img.get("image_url"),
+                    "caption": cap,
+                    "page_number": img_page or 1,
+                    "source": img.get("source", "document"),
+                    "similarity_score": round(cos_sim, 4),
+                    "score": round(final_score, 4),
+                    "width": img.get("width"),
+                    "height": img.get("height"),
+                })
+
+        scored_figures.sort(key=lambda x: x["score"], reverse=True)
+        return scored_figures[:top_n]
 
     def get_stats(self) -> Dict:
         """Get pipeline statistics."""

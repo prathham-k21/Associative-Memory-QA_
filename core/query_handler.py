@@ -14,6 +14,10 @@ from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass, field
 
 
+from collections import Counter
+from typing import List, Dict, Tuple, Optional, Set, Union
+
+
 @dataclass
 class ProcessedQuery:
     """Result of query processing pipeline."""
@@ -85,6 +89,15 @@ class QueryProcessor:
 
     def __init__(self, expand_abbreviations: bool = True):
         self.expand_abbreviations = expand_abbreviations
+        self.vocabulary: Counter = Counter()
+
+    def update_vocabulary(self, text_or_words: Union[str, List[str]]) -> None:
+        """Register domain tokens from ingested documents for spelling correction."""
+        if isinstance(text_or_words, str):
+            words = re.findall(r'\b[a-zA-Z]{3,}\b', text_or_words.lower())
+        else:
+            words = [w.lower() for w in text_or_words if len(w) >= 3]
+        self.vocabulary.update(words)
 
     def _detect_noise(self, text: str) -> Tuple[bool, float]:
         """
@@ -310,6 +323,82 @@ class QueryProcessor:
 
         return contextualized.strip()
 
+    @staticmethod
+    def _edit_distance(s1: str, s2: str) -> int:
+        """Compute Levenshtein edit distance with length difference pruning."""
+        if abs(len(s1) - len(s2)) > 2:
+            return 99
+        m, n = len(s1), len(s2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        for i in range(m + 1):
+            dp[i][0] = i
+        for j in range(n + 1):
+            dp[0][j] = j
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                cost = 0 if s1[i - 1] == s2[j - 1] else 1
+                dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+        return dp[m][n]
+
+    def _correct_typos(self, text: str) -> Tuple[str, Dict[str, str]]:
+        """
+        Correct spelling mistakes and typos by matching against corpus vocabulary.
+        E.g., 'what is bid data' -> 'what is big data', 'nosql databse' -> 'nosql database'.
+        """
+        if not self.vocabulary:
+            return text, {}
+
+        protected = self.STOPWORDS | {
+            "define", "explain", "meaning", "overview", "detail", "details",
+            "compare", "versus", "difference", "between", "how", "what",
+            "where", "when", "why", "who", "which", "marks", "mark", "format"
+        }
+
+        tokens = text.split()
+        corrected_tokens = []
+        typos_fixed = {}
+
+        for token in tokens:
+            m = re.match(r'^([^\w]*)([\w\-]+)([^\w]*)$', token)
+            if not m:
+                corrected_tokens.append(token)
+                continue
+
+            prefix, word, suffix = m.groups()
+            word_low = word.lower()
+
+            if len(word_low) < 3 or word_low in protected or self.vocabulary.get(word_low, 0) >= 5:
+                corrected_tokens.append(token)
+                continue
+
+            # Search vocabulary for nearest high-frequency term
+            max_allowed = 1 if len(word_low) <= 4 else 2
+            best_cand = None
+            min_dist = 99
+            max_freq = 0
+
+            for term, freq in self.vocabulary.items():
+                if freq < 1:
+                    continue
+                d = self._edit_distance(word_low, term)
+                if d <= max_allowed:
+                    if d < min_dist or (d == min_dist and freq > max_freq):
+                        min_dist = d
+                        max_freq = freq
+                        best_cand = term
+
+            current_freq = self.vocabulary.get(word_low, 0)
+            if best_cand and (current_freq == 0 or max_freq >= max(3, current_freq * 3)):
+                # Preserve capitalization
+                replacement = best_cand.capitalize() if word.istitle() else best_cand
+                typos_fixed[word] = replacement
+                corrected_tokens.append(f"{prefix}{replacement}{suffix}")
+            else:
+                corrected_tokens.append(token)
+
+        corrected_text = " ".join(corrected_tokens)
+        return corrected_text, typos_fixed
+
     def process(
         self,
         raw_query: str,
@@ -323,9 +412,10 @@ class QueryProcessor:
         2. Clean text
         3. Detect noise
         4. Expand abbreviations
-        5. Extract keywords
-        6. Detect query type
-        7. Generate variants
+        5. Vocabulary-aware typo and spelling correction
+        6. Extract keywords
+        7. Detect query type
+        8. Generate variants
 
         Returns:
             ProcessedQuery with all processed fields populated.
@@ -337,13 +427,26 @@ class QueryProcessor:
         if self.expand_abbreviations:
             cleaned = self._expand_abbreviations(cleaned)
 
-        keywords = self._extract_keywords(cleaned)
-        query_type = self._detect_query_type(cleaned)
-        variants = self._generate_variants(cleaned, keywords, query_type)
+        # Apply corpus-aware typo correction
+        corrected_query, typos_fixed = self._correct_typos(cleaned)
+
+        # Use corrected query as primary representation if typos were fixed
+        query_for_retrieval = corrected_query if typos_fixed else cleaned
+        if typos_fixed:
+            is_noisy = True
+            noise_score = max(noise_score, 0.4)
+
+        keywords = self._extract_keywords(query_for_retrieval)
+        query_type = self._detect_query_type(query_for_retrieval)
+        variants = self._generate_variants(query_for_retrieval, keywords, query_type)
+
+        # Include original cleaned form in variants if corrected
+        if typos_fixed and cleaned.lower() not in [v.lower() for v in variants]:
+            variants.append(cleaned)
 
         return ProcessedQuery(
             original=raw_query,
-            cleaned=cleaned,
+            cleaned=query_for_retrieval,
             variants=variants,
             keywords=keywords,
             is_noisy=is_noisy,
@@ -352,7 +455,9 @@ class QueryProcessor:
             metadata={
                 "n_variants": len(variants),
                 "n_keywords": len(keywords),
-                "contextualized_query": contextualized if contextualized != raw_query else None
+                "contextualized_query": contextualized if contextualized != raw_query else None,
+                "typos_fixed": typos_fixed,
+                "corrected_query": corrected_query if typos_fixed else None,
             }
         )
 
